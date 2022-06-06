@@ -70,7 +70,7 @@ async fn connection_pipeline(
     standby_status: Arc<AtomicBool>,
     idr_request_notifier: Arc<Notify>,
 ) -> StrResult {
-    let config = storage::load_config()?;
+    let config = platform::load_config()?;
     let hostname = config.hostname;
     error!("hostname: {hostname}");
 

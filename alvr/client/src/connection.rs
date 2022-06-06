@@ -2,14 +2,14 @@
 
 use crate::{
     connection_utils::{self, ConnectionError},
-    decoder::{DECODER_REF, IDR_PARSED},
+    platform,
     statistics::StatisticsManager,
-    storage, VideoFrame, CONTROL_CHANNEL_SENDER, INPUT_SENDER, STATISTICS_MANAGER,
+    VideoFrame, CONTROL_CHANNEL_SENDER, DECODER_INIT_CONFIG, INPUT_SENDER, STATISTICS_MANAGER,
     STATISTICS_SENDER,
 };
 use alvr_audio::{AudioDevice, AudioDeviceType};
-use alvr_common::{glam::Vec2, prelude::*, ALVR_NAME, ALVR_VERSION};
-use alvr_session::{AudioDeviceId, CodecType, SessionDesc};
+use alvr_common::{prelude::*, ALVR_NAME, ALVR_VERSION};
+use alvr_session::{AudioDeviceId, CodecType, MediacodecDataType, SessionDesc};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket, Haptics,
     HeadsetInfoPacket, PeerType, ProtoControlSocket, ServerControlPacket, ServerHandshakePacket,
@@ -20,7 +20,6 @@ use glyph_brush_layout::{
     ab_glyph::{Font, FontRef, ScaleFont},
     FontId, GlyphPositioner, HorizontalAlign, Layout, SectionGeometry, SectionText, VerticalAlign,
 };
-use jni::JavaVM;
 use serde_json as json;
 use settings_schema::Switch;
 use std::{
@@ -33,8 +32,7 @@ use std::{
 };
 use tokio::{
     sync::{mpsc as tmpsc, Mutex},
-    task,
-    time::{self, Instant},
+    task, time,
 };
 
 const INITIAL_MESSAGE: &str = "Searching for server...\n(open ALVR on your PC)";
@@ -71,7 +69,7 @@ impl Drop for StreamCloseGuard {
 }
 
 fn set_loading_message(message: &str) {
-    let hostname = storage::load_config().hostname;
+    let hostname = platform::load_config().hostname;
 
     let message = format!(
         "ALVR v{}\nhostname: {hostname}\n \n{message}",
@@ -119,13 +117,11 @@ fn set_loading_message(message: &str) {
 }
 
 fn on_server_connected(fps: f32, codec: CodecType, realtime_decoder: bool) {
-    let vm = unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap() };
+    let vm = platform::vm();
     let env = vm.attach_current_thread().unwrap();
 
-    let activity = ndk_context::android_context().context().cast();
-
     env.call_method(
-        activity,
+        platform::context(),
         "onServerConnected",
         "(FIZ)V",
         &[
@@ -138,8 +134,8 @@ fn on_server_connected(fps: f32, codec: CodecType, realtime_decoder: bool) {
 }
 
 async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
-    let device_name = storage::device_name();
-    let hostname = storage::load_config().hostname;
+    let device_name = platform::device_name();
+    let hostname = platform::load_config().hostname;
 
     let handshake_packet = ClientHandshakePacket {
         alvr_name: ALVR_NAME.into(),
@@ -271,14 +267,32 @@ async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
     };
 
     {
-        let mut config = storage::load_config();
+        let mut config = platform::load_config();
         config.dark_mode = settings.extra.client_dark_mode;
-        storage::store_config(&config);
+        platform::store_config(&config);
     }
 
     // create this before initializing the stream on cpp side
     let (control_channel_sender, mut control_channel_receiver) = tmpsc::unbounded_channel();
     *CONTROL_CHANNEL_SENDER.lock() = Some(control_channel_sender);
+
+    {
+        let config = &mut *DECODER_INIT_CONFIG.lock();
+
+        config.codec = settings.video.codec;
+
+        config.options = vec![
+            ("operating-rate".into(), MediacodecDataType::Int32(i32::MAX)),
+            ("priority".into(), MediacodecDataType::Int32(0)),
+            // low-latency: only applicable on API level 30. Quest 1 and 2 might not be
+            // cabable, since they are on level 29.
+            ("low-latency".into(), MediacodecDataType::Int32(1)),
+            (
+                "vendor.qti-ext-dec-low-latency.enable".into(),
+                MediacodecDataType::Int32(1),
+            ),
+        ];
+    }
 
     unsafe {
         crate::setStreamConfig(crate::StreamConfigInput {
@@ -488,38 +502,16 @@ async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
             unsafe {
                 // Note: legacyReceive() requires the java context to be attached to the current thread
                 // todo: investigate why
-                let vm = JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap();
-                let env = vm.attach_current_thread().unwrap();
+                let vm = platform::vm();
+                let _env = vm.attach_current_thread().unwrap();
 
                 crate::initializeSocket(matches!(codec, CodecType::HEVC) as _, enable_fec);
 
-                let mut idr_request_deadline = None;
-
                 while let Ok(mut data) = legacy_receive_data_receiver.recv() {
-                    // Send again IDR packet every 2s in case it is missed
-                    // (due to dropped burst of packets at the start of the stream or otherwise).
-                    if !IDR_PARSED.load(Ordering::Relaxed) {
-                        if let Some(deadline) = idr_request_deadline {
-                            if deadline < Instant::now() {
-                                if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-                                    sender.send(ClientControlPacket::RequestIdr).ok();
-                                }
-                                idr_request_deadline = None;
-                            }
-                        } else {
-                            idr_request_deadline = Some(Instant::now() + Duration::from_secs(2));
-                        }
-                    }
-
                     crate::legacyReceive(data.as_mut_ptr(), data.len() as _);
                 }
 
                 crate::closeSocket();
-
-                if let Some(decoder) = &*DECODER_REF.lock() {
-                    env.call_method(decoder.as_obj(), "onDisconnect", "()V", &[])
-                        .unwrap();
-                }
             }
 
             Ok(())

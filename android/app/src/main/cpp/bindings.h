@@ -153,3 +153,4 @@ extern "C" void (*playspaceSend)(float width, float height);
 extern "C" unsigned long long (*pathStringToHash)(const char *path);
 
 extern "C" void (*pushNal)(const char *buffer, int length, unsigned long long frameIndex);
+extern "C" void (*createDecoder)(const char *csd_0, int length);

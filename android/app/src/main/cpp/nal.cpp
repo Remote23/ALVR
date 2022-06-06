@@ -15,6 +15,7 @@ static const std::byte NAL_TYPE_SPS = static_cast<const std::byte>(7);
 static const std::byte H265_NAL_TYPE_VPS = static_cast<const std::byte>(32);
 
 void (*pushNal)(const char *buffer, int length, unsigned long long frameIndex);
+void (*createDecoder)(const char *csd_0, int length);
 
 NALParser::NALParser(bool enableFEC) : m_enableFEC(enableFEC)
 {
@@ -65,7 +66,7 @@ bool NALParser::processPacket(VideoFrame *packet, int packetSize, bool &fecFailu
                 return false;
             }
             LOGI("Got frame=%d %d, Codec=%d", (std::int32_t) NALType, end, m_codec);
-            pushNal((const char *)&frameBuffer[0], end, packet->trackingFrameIndex);
+            createDecoder((const char *)&frameBuffer[0], end);
             pushNal((const char *)&frameBuffer[end], frameByteSize - end, packet->trackingFrameIndex);
 
             m_queue.clearFecFailure();

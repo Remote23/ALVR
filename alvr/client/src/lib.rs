@@ -2,13 +2,9 @@
 
 mod connection;
 mod connection_utils;
-mod decoder;
 mod logging_backend;
+mod platform;
 mod statistics;
-mod storage;
-
-#[cfg(target_os = "android")]
-mod permission;
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -20,25 +16,19 @@ use alvr_common::{
     prelude::*,
     ALVR_VERSION, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID,
 };
-use alvr_session::{AudioDeviceId, Fov};
+use alvr_session::{AudioDeviceId, CodecType, Fov, MediacodecDataType};
 use alvr_sockets::{
     BatteryPacket, ClientControlPacket, ClientStatistics, HeadsetInfoPacket, Input,
     LegacyController, LegacyInput, MotionData, ViewsConfig,
 };
-use decoder::{DECODER_REF, STREAM_TEAXTURE_HANDLE};
 use jni::{
-    objects::{GlobalRef, JObject, ReleaseMode},
-    sys::{jboolean, jobject},
+    objects::{GlobalRef, JObject},
+    sys::jboolean,
     JNIEnv, JavaVM,
 };
+use platform::{VideoDecoderDequeuer, VideoDecoderEnqueuer};
 use statistics::StatisticsManager;
-use std::{
-    collections::HashMap,
-    ffi::CStr,
-    os::raw::{c_char, c_uchar},
-    ptr, slice,
-    time::Duration,
-};
+use std::{collections::HashMap, ffi::CStr, os::raw::c_char, ptr, slice, thread, time::Duration};
 use tokio::{runtime::Runtime, sync::mpsc, sync::Notify};
 
 // This is the actual storage for the context pointer set in ndk-context. usually stored in
@@ -56,6 +46,24 @@ static STATISTICS_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ClientStatisti
 static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ClientControlPacket>>>> =
     Lazy::new(|| Mutex::new(None));
 static ON_PAUSE_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+
+pub struct DecoderInitConfig {
+    codec: CodecType,
+    options: Vec<(String, MediacodecDataType)>,
+    gl_surface_handle: i32,
+}
+
+pub static DECODER_INIT_CONFIG: Lazy<Mutex<DecoderInitConfig>> = Lazy::new(|| {
+    Mutex::new(DecoderInitConfig {
+        codec: CodecType::H264,
+        options: vec![],
+        gl_surface_handle: 0,
+    })
+});
+pub static DECODER_ENQUEUER: Lazy<Mutex<Option<VideoDecoderEnqueuer>>> =
+    Lazy::new(|| Mutex::new(None));
+pub static DECODER_DEQUEUER: Lazy<Mutex<Option<VideoDecoderDequeuer>>> =
+    Lazy::new(|| Mutex::new(None));
 
 extern "C" fn views_config_send(fov: *const EyeFov, ipd_m: f32) {
     let fov = unsafe { slice::from_raw_parts(fov, 2) };
@@ -135,23 +143,18 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_renderNativ
     _: JNIEnv,
     _: JObject,
 ) {
-    let rendered_frame_index = if let Some(decoder) = &*DECODER_REF.lock() {
-        let vm = JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap();
-        let env = vm.get_env().unwrap();
-
-        env.call_method(decoder.as_obj(), "clearAvailable", "()J", &[])
-            .unwrap()
-            .j()
-            .unwrap()
+    let timestamp = if let Some(decoder) = &*DECODER_DEQUEUER.lock() {
+        decoder.dequeue_frame(Duration::from_millis(20)).unwrap()
     } else {
-        -1
+        thread::sleep(Duration::from_millis(13));
+        None
     };
 
-    if rendered_frame_index != -1 {
+    if let Some(timestamp) = timestamp {
         if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-            stats.report_frame_decoded(Duration::from_nanos(rendered_frame_index as _));
+            stats.report_frame_decoded(timestamp);
         }
-        renderNative(rendered_frame_index);
+        renderNative(timestamp.as_nanos() as _);
     }
 }
 
@@ -168,22 +171,9 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onResumeNat
     _: JNIEnv,
     _: JObject,
     jscreen_surface: JObject,
-    decoder: JObject,
 ) {
     alvr_common::show_err(|| -> StrResult {
-        let vm = JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap();
-        let env = vm.get_env().unwrap();
-
-        // let decoder_class = env
-        //     .find_class("com/polygraphene/alvr/DecoderThread")
-        //     .unwrap();
-        // let handle = *STREAM_TEAXTURE_HANDLE.lock();
-        // let decoder = env
-        //     .new_object(decoder_class, "(I)V", &[handle.into()])
-        //     .unwrap();
-        *DECODER_REF.lock() = Some(env.new_global_ref(decoder).map_err(err!())?);
-
-        let config = storage::load_config();
+        let config = platform::load_config();
 
         let result = resumeVR(*jscreen_surface as _);
         prepareLoadingRoom(
@@ -243,24 +233,11 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onStreamSta
     playspace_send(config.areaWidth, config.areaHeight);
 
     streamStartNative();
-
-    let vm = JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap();
-    let env = vm.get_env().unwrap();
-
-    if let Some(decoder) = &*DECODER_REF.lock() {
-        env.call_method(
-            decoder.as_obj(),
-            "onConnect",
-            "(IZ)V",
-            &[codec.into(), real_time.into()],
-        )
-        .unwrap();
-    }
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onPauseNative(
-    env: JNIEnv,
+    _: JNIEnv,
     _: JObject,
 ) {
     ON_PAUSE_NOTIFIER.notify_waiters();
@@ -271,10 +248,8 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onPauseNati
     destroyRenderers();
     pauseVR();
 
-    if let Some(decoder) = DECODER_REF.lock().take() {
-        env.call_method(decoder.as_obj(), "stopAndWait", "()V", &[])
-            .unwrap();
-    }
+    *DECODER_ENQUEUER.lock() = None;
+    *DECODER_DEQUEUER.lock() = None;
 }
 
 #[no_mangle]
@@ -494,56 +469,39 @@ pub fn initialize() {
         }
     }
 
+    extern "C" fn create_decoder(buffer: *const c_char, length: i32) {
+        error!("create decoder");
+
+        let mut csd_0 = vec![0; length as _];
+        unsafe { ptr::copy_nonoverlapping(buffer, csd_0.as_mut_ptr(), length as _) };
+
+        let config = &*DECODER_INIT_CONFIG.lock();
+        let (enqueuer, dequeuer) = platform::video_decoder_split(
+            config.codec,
+            &csd_0,
+            &config.options,
+            config.gl_surface_handle,
+        )
+        .unwrap();
+
+        *DECODER_ENQUEUER.lock() = Some(enqueuer);
+        *DECODER_DEQUEUER.lock() = Some(dequeuer);
+
+        if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
+            sender.send(ClientControlPacket::RequestIdr).ok();
+        }
+    }
+
     extern "C" fn push_nal(buffer: *const c_char, length: i32, frame_index: u64) {
-        let vm = unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap() };
-        let env = vm.get_env().unwrap();
+        error!("push nal");
+        if let Some(decoder) = &*DECODER_ENQUEUER.lock() {
+            let timestamp = Duration::from_nanos(frame_index);
 
-        let decoder_lock = DECODER_REF.lock();
+            // todo: check is copy can be avoided
+            let mut nal_buffer = vec![0; length as _];
+            unsafe { ptr::copy_nonoverlapping(buffer, nal_buffer.as_mut_ptr(), length as _) }
 
-        let nal = if let Some(decoder) = &*decoder_lock {
-            env.call_method(
-                decoder,
-                "obtainNAL",
-                "(I)Lcom/polygraphene/alvr/NAL;",
-                &[length.into()],
-            )
-            .unwrap()
-            .l()
-            .unwrap()
-        } else {
-            let nal_class = env.find_class("com/polygraphene/alvr/NAL").unwrap();
-            env.new_object(
-                nal_class,
-                "(I)Lcom/polygraphene/alvr/NAL;",
-                &[length.into()],
-            )
-            .unwrap()
-        };
-
-        if nal.is_null() {
-            return;
-        }
-
-        env.set_field(nal, "length", "I", length.into()).unwrap();
-        env.set_field(nal, "frameIndex", "J", (frame_index as i64).into())
-            .unwrap();
-        {
-            let jarray = env.get_field(nal, "buf", "[B").unwrap().l().unwrap();
-            let jbuffer = env
-                .get_byte_array_elements(*jarray, ReleaseMode::CopyBack)
-                .unwrap();
-            unsafe { ptr::copy_nonoverlapping(buffer as _, jbuffer.as_ptr(), length as usize) };
-            jbuffer.commit().unwrap();
-        }
-
-        if let Some(decoder) = &*decoder_lock {
-            env.call_method(
-                decoder,
-                "pushNAL",
-                "(Lcom/polygraphene/alvr/NAL;)V",
-                &[nal.into()],
-            )
-            .unwrap();
+            show_err(decoder.push_frame_nal(timestamp, &nal_buffer, Duration::from_millis(500)));
         }
     }
 
@@ -556,23 +514,24 @@ pub fn initialize() {
         viewsConfigSend = Some(views_config_send);
         batterySend = Some(battery_send);
         playspaceSend = Some(playspace_send);
+        createDecoder = Some(create_decoder);
         pushNal = Some(push_nal);
     }
 
     // Make sure to reset config in case of version compat mismatch.
-    if storage::load_config().protocol_id != alvr_common::protocol_id() {
+    if platform::load_config().protocol_id != alvr_common::protocol_id() {
         // NB: Config::default() sets the current protocol ID
-        storage::store_config(&storage::Config::default());
+        platform::store_config(&platform::Config::default());
     }
 
-    permission::try_get_microphone_permission();
+    platform::try_get_microphone_permission();
 
-    let vm = unsafe { jni::JavaVM::from_raw(ndk_context::android_context().vm().cast()).unwrap() };
+    let vm = platform::vm();
     let env = vm.attach_current_thread().unwrap();
 
     let asset_manager = env
         .call_method(
-            ndk_context::android_context().context().cast(),
+            platform::context(),
             "getAssets",
             "()Landroid/content/res/AssetManager;",
             &[],
@@ -589,9 +548,12 @@ pub fn initialize() {
             *asset_manager.as_obj() as _,
         )
     };
-    *STREAM_TEAXTURE_HANDLE.lock() = result.streamSurfaceHandle;
+    DECODER_INIT_CONFIG.lock().gl_surface_handle = result.streamSurfaceHandle;
 
-    GLOBAL_ASSET_MANAGER.set(asset_manager);
+    GLOBAL_ASSET_MANAGER
+        .set(asset_manager)
+        .map_err(|_| ())
+        .unwrap();
 }
 
 pub fn destroy() {

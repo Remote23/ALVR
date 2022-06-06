@@ -1,21 +1,18 @@
-#[cfg(target_os = "android")]
+// #[cfg(target_os = "android")]
 mod android;
-#[cfg(not(target_os = "android"))]
-mod desktop;
 
-#[cfg(target_os = "android")]
+// #[cfg(target_os = "android")]
 use android::*;
-#[cfg(not(target_os = "android"))]
-use desktop::*;
 
 use alvr_common::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "android")]
-pub use android::{device_name, load_asset};
-#[cfg(not(target_os = "android"))]
-pub use desktop::{device_name, load_asset};
+// #[cfg(target_os = "android")]
+pub use android::{
+    vm, context, device_name, load_asset, try_get_microphone_permission, video_decoder_split,
+    VideoDecoderDequeuer, VideoDecoderEnqueuer,
+};
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {

@@ -26,6 +26,9 @@ public class OvrActivity extends Activity {
 
     final static String TAG = "OvrActivity";
 
+    // dummy variable to load class for JNI
+    SyncSurfaceInner _dummy;
+
     class RenderingCallbacks implements SurfaceHolder.Callback {
         @Override
         public void surfaceCreated(@NonNull final SurfaceHolder holder) {
@@ -58,7 +61,6 @@ public class OvrActivity extends Activity {
     Handler mRenderingHandler;
     HandlerThread mRenderingHandlerThread;
     Surface mScreenSurface;
-    DecoderThread mDecoderThread = null;
     float mRefreshRate = 60f;
 
     // Cache method references for performance reasons
@@ -97,8 +99,7 @@ public class OvrActivity extends Activity {
     void maybeResume() {
         if (mResumed && mScreenSurface != null) {
             mRenderingHandler.post(() -> {
-                mDecoderThread = new DecoderThread();
-                onResumeNative(mScreenSurface, mDecoderThread);
+                onResumeNative(mScreenSurface);
 
                 // bootstrap the rendering loop
                 mRenderingHandler.post(mRenderRunnable);
@@ -119,6 +120,7 @@ public class OvrActivity extends Activity {
         // mScreenSurface != null will be false after this method returns.
         if (mResumed && mScreenSurface != null) {
             mRenderingHandler.post(this::onPauseNative);
+            mRenderingHandler.removeCallbacks(mRenderRunnable);
         }
     }
 
@@ -149,6 +151,7 @@ public class OvrActivity extends Activity {
 
     private void render() {
         if (mResumed && mScreenSurface != null) {
+            Utils.loge(TAG, () -> "java render");
             if (isConnectedNative()) {
                 renderNative();
 
@@ -166,8 +169,7 @@ public class OvrActivity extends Activity {
 
     native void destroyNative();
 
-    // nal_class is needed to access NAL objects fields in native code without access to a Java thread
-    native void onResumeNative(Surface screenSurface, DecoderThread decoder);
+    native void onResumeNative(Surface screenSurface);
 
     native void onPauseNative();
 
@@ -180,8 +182,6 @@ public class OvrActivity extends Activity {
     native void onBatteryChangedNative(int battery, int plugged);
 
     native boolean isConnectedNative();
-
-    native void requestIDR();
 
     @SuppressWarnings("unused")
     public void onServerConnected(float fps, int codec, boolean realtimeDecoder) {
